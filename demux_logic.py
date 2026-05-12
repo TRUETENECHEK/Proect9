@@ -742,19 +742,40 @@ def _run_primer_qc(
 
     required = str(primer_config.get("required", "any")).lower()
     missing_refs = set(primer_references) - set(best_by_ref)
-    warning = required == "all" and bool(missing_refs)
+    repeated_refs = _repeated_primer_refs(matches)
+    warn_on_repeat = bool(primer_config.get("warn_on_repeat", True))
+    warning = (required == "all" and bool(missing_refs)) or (
+        warn_on_repeat and bool(repeated_refs)
+    )
     penalty = sum(
         _edit_penalty_from_errors(match["errors"], config)
         for match in best_by_ref.values()
     )
+    if repeated_refs:
+        repeat_penalty = float(
+            primer_config.get(
+                "repeat_penalty",
+                (config.get("layout_scoring", {}) or {}).get(
+                    "repeat_primer_penalty",
+                    (config.get("scoring_weights", {}) or {}).get("repeat_primer_penalty", 0),
+                ),
+            )
+        )
+        penalty += sum(repeated_refs.values()) * abs(repeat_penalty)
+
+    reasons = []
+    if required == "all" and missing_refs:
+        reasons.append(f"Missing primer QC anchors: {', '.join(sorted(missing_refs))}")
+    if warn_on_repeat and repeated_refs:
+        reasons.append(
+            "Repeated primer QC anchors inside the amplicon: "
+            + ", ".join(sorted(repeated_refs))
+        )
+
     return {
         "warning": warning,
         "penalty": penalty,
-        "reason": (
-            f"Missing primer QC anchors: {', '.join(sorted(missing_refs))}"
-            if warning
-            else ""
-        ),
+        "reason": "; ".join(reasons) if warning else "",
     }
 
 
@@ -790,6 +811,20 @@ def _primer_references(config: Mapping[str, Any]) -> tuple[dict[str, str], Mappi
             return sequence_items, primer_config
 
     return {}, primer_config if isinstance(primer_config, Mapping) else {}
+
+
+def _repeated_primer_refs(matches: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    spans_by_ref: dict[str, set[tuple[int, int]]] = {}
+    for match in matches:
+        ref_id = str(match["ref_id"])
+        spans_by_ref.setdefault(ref_id, set()).add(
+            (int(match["start"]), int(match["end"]))
+        )
+    return {
+        ref_id: len(spans) - 1
+        for ref_id, spans in spans_by_ref.items()
+        if len(spans) > 1
+    }
 
 
 def _find_simple_reference_matches(
