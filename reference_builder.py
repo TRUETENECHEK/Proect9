@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Mapping, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Tuple, Optional
 
 from data_loader import load_config, load_fasta_dict
 
@@ -52,7 +52,7 @@ def build_reference_bundle_from_config(config_path: str = "config.yaml") -> Refe
     return build_reference_bundle(config, base_dir=base_dir)
 
 
-def build_reference_bundle(config: Mapping[str, Any], base_dir: str = ".") -> ReferenceBundle:
+def build_reference_bundle(config: Mapping[str, Any], base_dir: str = ".", discovered_adapters: Dict[str, str] = None) -> ReferenceBundle:
     builder_config = config.get("reference_builder", {})
     if not builder_config:
         raise ValueError("Missing reference_builder section in config.yaml")
@@ -86,10 +86,28 @@ def build_reference_bundle(config: Mapping[str, Any], base_dir: str = ".") -> Re
 
     for side, side_records in grouped_records.items():
         side_edge = str(groups_config[side].get("edge", edge)).lower()
-        if side_edge not in VALID_EDGES:
-            raise ValueError(f"edge for group {side!r} must be one of {VALID_EDGES}, got {side_edge!r}")
+        
+        # Use discovered adapter if available, otherwise fallback to finding it in FASTA
+        adapter = ""
+        if discovered_adapters and side in discovered_adapters:
+            adapter = discovered_adapters[side]
+        
+        fasta_adapter, fasta_cores, fasta_selected_edge = _extract_adapter_and_cores(side_records, side_edge)
+        
+        if not adapter:
+            adapter = fasta_adapter
+            cores = fasta_cores
+            selected_edge = fasta_selected_edge
+        else:
+            discovery_cfg = builder_config.get("adapter_discovery", {}) or {}
+            min_fit_fraction = float(discovery_cfg.get("min_fit_fraction", 0.8))
+            selected_edge, cores, fit_fraction = _strip_adapter_cores(side_records, adapter, side_edge)
 
-        adapter, cores, selected_edge = _extract_adapter_and_cores(side_records, side_edge)
+            if fit_fraction < min_fit_fraction:
+                adapter = fasta_adapter
+                cores = fasta_cores
+                selected_edge = fasta_selected_edge
+
         adapters[side] = adapter
         barcode_cores[side] = cores
         edge_by_side[side] = selected_edge
@@ -180,7 +198,7 @@ def _extract_adapter_and_cores(
         adapter = suffix if selected_edge == "suffix" else prefix
 
     if not adapter:
-        raise ValueError("Could not find a non-empty common adapter edge with 100% identity")
+        return "", {k: v for k, v in records.items()}, edge
 
     if selected_edge == "prefix":
         cores = {
@@ -194,6 +212,49 @@ def _extract_adapter_and_cores(
         }
 
     return adapter, cores, selected_edge
+
+
+def _strip_adapter_cores(
+    records: Mapping[str, str],
+    adapter: str,
+    preferred_edge: str,
+) -> Tuple[str, Dict[str, str], float]:
+    if not adapter:
+        return preferred_edge, dict(records), 0.0
+
+    prefix_cores: Dict[str, str] = {}
+    suffix_cores: Dict[str, str] = {}
+
+    prefix_hits = 0
+    suffix_hits = 0
+    total = max(1, len(records))
+
+    for record_id, sequence in records.items():
+        if sequence.startswith(adapter):
+            prefix_cores[record_id] = sequence[len(adapter):]
+            prefix_hits += 1
+        if sequence.endswith(adapter):
+            suffix_cores[record_id] = sequence[:-len(adapter)]
+            suffix_hits += 1
+
+    if preferred_edge == "prefix":
+        selected_edge = "prefix"
+        cores = prefix_cores
+        fit_fraction = prefix_hits / total
+    elif preferred_edge == "suffix":
+        selected_edge = "suffix"
+        cores = suffix_cores
+        fit_fraction = suffix_hits / total
+    else:
+        use_suffix = suffix_hits >= prefix_hits
+        selected_edge = "suffix" if use_suffix else "prefix"
+        cores = suffix_cores if use_suffix else prefix_cores
+        fit_fraction = (suffix_hits if use_suffix else prefix_hits) / total
+
+    if not cores:
+        return selected_edge, dict(records), 0.0
+
+    return selected_edge, cores, fit_fraction
 
 
 def _longest_common_prefix(sequences: List[str]) -> str:
